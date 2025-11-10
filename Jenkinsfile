@@ -12,16 +12,16 @@ pipeline {
     environment {
         // >>> GANTI BAGIAN INI <<<
         // Nama file Python monitor khusus teman kamu
-        SCRIPT_FILE = "monitorTeman.py"
+        SCRIPT_FILE = "monitorAkmal.py"
 
         // Token Fonnte teman kamu
-        FONNTE_TOKEN = "GANTI_DENGAN_TOKEN_FONNTE_TEMAN"
+        FONNTE_TOKEN = "R3JmjUG5sAmGbSEE7gcGqy"
 
         // Nomor WhatsApp target Fonnte (bisa lebih dari 1, pisahkan dengan koma)
-        FONNTE_TARGETS = "6281234567890"
+        FONNTE_TARGETS = "6281933976553"
 
         // API Key Gemini milik teman kamu
-        GEMINI_API_KEY = "GANTI_DENGAN_API_KEY_GEMINI_TEMAN"
+        GEMINI_API_KEY = "AIzaSyCleGyLzyLB4Ni08RiqJo3bq6E789pGWM4"
         GEMINI_MODEL = "gemini-2.5-flash"
     }
 
@@ -57,7 +57,7 @@ pipeline {
 import os, socket, datetime, requests
 HOSTNAME = socket.gethostname()
 ts = datetime.datetime.now().isoformat()
-msg = f"[BotTeman] Jenkins build monitorTeman.py dimulai di {HOSTNAME} @ {ts}."
+msg = f"[BotTeman] Jenkins build monitorAkmal.py dimulai di {HOSTNAME} @ {ts}."
 
 # Cek koneksi Gemini
 try:
@@ -93,8 +93,8 @@ PY
             steps {
                 sh '''
                     set -e
-                    LOG_FILE="$(pwd)/monitorTeman.log"
-                    PID_FILE="$(pwd)/monitorTeman.pid"
+                    LOG_FILE="$(pwd)/monitorAkmal.log"
+                    PID_FILE="$(pwd)/monitorAkmal.pid"
                     echo "[RUN] Menjalankan $SCRIPT_FILE..."
 
                     if [ ! -f "$SCRIPT_FILE" ]; then
@@ -140,7 +140,7 @@ PY
     post {
         always {
             echo "[POST] Arsipkan log..."
-            archiveArtifacts artifacts: 'monitorTeman.log,monitorTeman.pid', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'monitorAkmal.log,monitorAkmal.pid', allowEmptyArchive: true
         }
         success { echo "[POST] Build sukses." }
         failure { echo "[POST] Build gagal." }
