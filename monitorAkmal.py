@@ -24,7 +24,7 @@ SUCCESS_THRESHOLD = 2
 ALERT_SESSION_OPEN = False  # False supaya session open tidak mengganggu
 
 # Fonnte API (gantikan dengan token dan nomor WA milikmu)
-FONNTE_TOKEN = "R3JmjUG5sAmGbSEE7gcGqy"
+FONNTE_TOKEN = "R3JmjUG5sAmGbSEE7gcG"
 FONNTE_TARGETS = ["6281933976553"]
 
 # Gemini API Key & model (gantikan dengan milikmu)
@@ -108,7 +108,7 @@ def gemini_insight_with_timeout(summary: str, timeout_sec: float = 6.0) -> str |
 
 def send_with_gemini(message: str, summary: str | None = None):
     insight = gemini_insight_with_timeout(summary or message)
-    block = f"\n\nAnalisis BotFajri (Gemini):\n{insight.strip()}" if (insight and insight.strip()) else "\n\nAnalisis BotFajri (Gemini): -"
+    block = f"\n\nAnalisis BotAkmal (Gemini):\n{insight.strip()}" if (insight and insight.strip()) else "\n\nAnalisis BotAkmal (Gemini): -"
     send_fonnte_message(message + block)
 
 
@@ -297,7 +297,7 @@ if __name__ == "__main__":
             sources = [p for p in LOG_PATHS if os.path.exists(p)]
             source_msg = f"files={', '.join(sources)}" if sources else "journald:ssh,sshd"
             send_with_gemini(
-                f"[BotFajri] monitor start di {HOSTNAME}. Sumber log: {source_msg}",
+                f"[BotAkmal] monitor start di {HOSTNAME}. Sumber log: {source_msg}",
                 summary=f"monitor startup host={HOSTNAME} sources={source_msg}"
             )
         except Exception as e:
