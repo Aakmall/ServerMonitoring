@@ -4,8 +4,8 @@ pipeline {
     PYTHON = "/usr/bin/python3"
   }
   triggers {
-    githubPush()  // tambahkan ini
-    cron('H 0 * * *')
+    githubPush()     // otomatis dari GitHub webhook
+    cron('H 0 * * *') // otomatis harian
   }
   stages {
     stage('Prepare') {
@@ -16,9 +16,8 @@ pipeline {
     }
     stage('Checkout') {
       steps {
-        // use HTTPS public repo (no credentials)
         checkout([$class: 'GitSCM', branches: [[name: '*/main']],
-                userRemoteConfigs: [[url: 'https://github.com/Aakmall/ServerMonitoring.git']]])
+                  userRemoteConfigs: [[url: 'https://github.com/Aakmall/ServerMonitoring.git']]])
       }
     }
     stage('Setup venv') {
@@ -35,7 +34,6 @@ pipeline {
       steps {
         sh '''
           . .venv/bin/activate || true
-          # Ensure script is executable
           chmod +x monitor.py || true
           sudo -n python3 monitor.py || python3 monitor.py
         '''
@@ -44,7 +42,7 @@ pipeline {
   }
   post {
     success {
-      archiveArtifacts artifacts: '**/report*.html, **/*.log', allowEmptyArchive: true
+      archiveArtifacts artifacts: '**/wa_alert_log.txt, **/*.log', allowEmptyArchive: true
       echo "Run finished successfully."
     }
     failure {
