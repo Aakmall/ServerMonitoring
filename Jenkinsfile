@@ -4,7 +4,7 @@ pipeline {
     PYTHON = "/usr/bin/python3"
   }
   triggers {
-    // run once per day at random minute in hour 0 -> H 0 * * *
+    githubPush()  // tambahkan ini
     cron('H 0 * * *')
   }
   stages {
