@@ -3,22 +3,14 @@ pipeline {
     options { timestamps() }
 
     triggers {
-        // Webhook GitHub (utama)
-        githubPush()
-        // Fallback polling SCM setiap ~2 menit bila webhook gagal
-        pollSCM('H/2 * * * *')
+        githubPush()               // Webhook GitHub
+        pollSCM('H/2 * * * *')    // fallback polling setiap ~2 menit
     }
 
     environment {
-        // Nama skrip monitor yang dijalankan
         SCRIPT_FILE = "monitorAkmal.py"
-        // NOTE: Untuk produksi, sebaiknya gunakan Jenkins Credentials
-        // dan withCredentials{} ketimbang hardcode di sini.
-        // Fonnte
         FONNTE_TOKEN = "YmDKKgGMMwRAYkyaaguc"
         FONNTE_TARGETS = "62882019908677"
-
-        // Gemini (BotFajri)
         GEMINI_API_KEY = "AIzaSyD-lbp5g18WGTjLEpSTOjeucZkYN_8em-8"
         GEMINI_MODEL = "gemini-2.5-flash"
     }
@@ -26,52 +18,50 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
+                echo "[CHECKOUT] Mengambil source code dari repo..."
+                checkout scm
                 sh '''
-#!/bin/bash
-echo "[CHECKOUT] Mengambil source code dari repo..."
-checkout scm
-ls -a | grep "$SCRIPT_FILE" || echo "[CHECKOUT] $SCRIPT_FILE tidak ditemukan di repo!"
-'''
+                    #!/bin/bash
+                    ls -a | grep "$SCRIPT_FILE" || echo "[CHECKOUT] $SCRIPT_FILE tidak ditemukan di repo!"
+                '''
             }
         }
 
         stage('Setup Python') {
             steps {
                 sh '''
-#!/bin/bash
-set -eu
-echo "[SETUP] Membuat virtual environment..."
-if [ ! -d .venv ]; then
-    python3 -m venv .venv
-fi
-. .venv/bin/activate
-pip install --upgrade pip
-pip install requests google-generativeai python-dotenv
-'''
+                    #!/bin/bash
+                    set -euo pipefail
+                    echo "[SETUP] Membuat virtual environment..."
+                    if [ ! -d .venv ]; then
+                        python3 -m venv .venv
+                    fi
+                    . .venv/bin/activate
+                    pip install --upgrade pip
+                    pip install requests google-generativeai python-dotenv
+                '''
             }
         }
 
         stage('Notify WhatsApp CI Start') {
             steps {
                 sh '''
-#!/bin/bash
-set -eu
-. .venv/bin/activate
-python - << 'PY'
+                    #!/bin/bash
+                    . .venv/bin/activate
+                    python - << 'PY'
 import os, socket, datetime, requests
+
 HOSTNAME = socket.gethostname()
 ts = datetime.datetime.now().isoformat()
-msg = f"[BotFajri] Jenkins build monitorAkmal.py dimulai di {HOSTNAME} @ {ts}."
+msg = f"[BotAkmal] Jenkins build monitorAkmal.py dimulai di {HOSTNAME} @ {ts}."
 
 # Tes integrasi Gemini
-gemini_ok = False
 try:
     import google.generativeai as genai
     genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
     model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
-    resp = model.generate_content("buatkan 2 kata kalau sekarang sudah gemini yang membalas.")
+    resp = model.generate_content("uji koneksi Gemini")
     if getattr(resp, 'text', ''):
-        gemini_ok = True
         msg += "\\nInsight Gemini: " + getattr(resp, 'text', '').strip()
 except Exception as e:
     msg += f"\\nAI Gemini gagal: {e}"
@@ -91,80 +81,55 @@ for t in targets:
     except Exception as e:
         print("Fonnte error", e)
 PY
-'''
+                '''
             }
         }
 
         stage('Run Monitor') {
             steps {
                 sh '''
-#!/bin/bash
-set -eu
-LOG_FILE="$(pwd)/monitor.log"
-PID_FILE="$(pwd)/monitor.pid"
-echo "[RUN] Menjalankan $SCRIPT_FILE..."
+                    #!/bin/bash
+                    set -euo pipefail
 
-# Validasi file skrip
-if [ ! -f "$SCRIPT_FILE" ]; then
-    echo "[RUN] FAIL: $SCRIPT_FILE tidak ditemukan di $(pwd)"
-    ls -la
-    exit 1
-fi
+                    LOG_FILE="$(pwd)/monitor.log"
+                    PID_FILE="$(pwd)/monitor.pid"
+                    echo "[RUN] Menjalankan $SCRIPT_FILE..."
 
-# Hentikan monitor lama jika masih berjalan
-if [ -f "$PID_FILE" ]; then
-    OLD=$(cat "$PID_FILE" || true)
-    if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
-        echo "[RUN] Menghentikan monitor lama ($OLD)..."
-        kill "$OLD" || true
-        sleep 1
-    fi
-fi
+                    if [ ! -f "$SCRIPT_FILE" ]; then
+                        echo "[RUN] FAIL: $SCRIPT_FILE tidak ditemukan di $(pwd)"
+                        ls -la
+                        exit 1
+                    fi
 
-# Jalankan skrip dengan interpreter dari venv (tanpa source activate)
-if [ ! -x .venv/bin/python ]; then
-    echo "[RUN] FAIL: .venv/bin/python tidak ditemukan/eksekutabel"
-    exit 1
-fi
+                    if [ -f "$PID_FILE" ]; then
+                        OLD=$(cat "$PID_FILE" || true)
+                        if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
+                            echo "[RUN] Menghentikan monitor lama ($OLD)..."
+                            kill "$OLD" || true
+                            sleep 1
+                        fi
+                    fi
 
-# Pastikan Jenkins tidak mematikan proses background setelah build selesai
-export BUILD_ID=dontKillMe
-export JENKINS_NODE_COOKIE=dontKillMe
+                    export BUILD_ID=dontKillMe
+                    export JENKINS_NODE_COOKIE=dontKillMe
 
-# Bersihkan proses lama yang mungkin masih hidup di luar PID file
-pkill -f "$SCRIPT_FILE" 2>/dev/null || true
-sleep 1
+                    pkill -f "$SCRIPT_FILE" 2>/dev/null || true
+                    sleep 1
 
-echo "[RUN] Python: $(.venv/bin/python -V)"
-RUNNER=".venv/bin/python -u \"$SCRIPT_FILE\""
-if command -v setsid >/dev/null 2>&1; then
-    echo "[RUN] Menjalankan via setsid+nohup"
-    nohup setsid bash -c "$RUNNER" > "$LOG_FILE" 2>&1 < /dev/null &
-else
-    echo "[RUN] Menjalankan via nohup"
-    nohup bash -c "$RUNNER" > "$LOG_FILE" 2>&1 < /dev/null &
-fi
-echo $! > "$PID_FILE"
-sleep 2
-if ps -p $(cat "$PID_FILE") >/dev/null 2>&1; then
-    echo "[RUN] OK: $SCRIPT_FILE berjalan (PID=$(cat "$PID_FILE"))"
-else
-    echo "[RUN] FAIL: Gagal menjalankan $SCRIPT_FILE"
-    tail -n 200 "$LOG_FILE" || true
-    exit 1
-fi
+                    echo "[RUN] Python: $(.venv/bin/python -V)"
+                    RUNNER=".venv/bin/python -u \"$SCRIPT_FILE\""
+                    nohup setsid bash -c "$RUNNER" > "$LOG_FILE" 2>&1 < /dev/null &
+                    echo $! > "$PID_FILE"
+                    sleep 2
 
-# Health probe: pastikan proses tidak langsung mati
-sleep 5
-if ps -p $(cat "$PID_FILE") >/dev/null 2>&1; then
-    echo "[RUN] HEALTH: proses masih hidup (PID=$(cat "$PID_FILE"))"
-else
-    echo "[RUN] HEALTH FAIL: proses mati segera setelah start"
-    echo "----- monitor.log (tail 200) -----"
-    tail -n 200 "$LOG_FILE" || true
-    exit 1
-fi
-'''
+                    if ps -p $(cat "$PID_FILE") >/dev/null 2>&1; then
+                        echo "[RUN] OK: $SCRIPT_FILE berjalan (PID=$(cat "$PID_FILE"))"
+                    else
+                        echo "[RUN] FAIL: Gagal menjalankan $SCRIPT_FILE"
+                        tail -n 200 "$LOG_FILE" || true
+                        exit 1
+                    fi
+                '''
             }
         }
     }
