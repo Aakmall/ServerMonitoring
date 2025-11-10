@@ -33,7 +33,6 @@ pipeline {
                     if [ ! -d .venv ]; then
                         python3 -m venv .venv
                     fi
-                    # aktifkan virtualenv
                     source .venv/bin/activate
                     pip install --upgrade pip
                     pip install requests google-generativeai python-dotenv
