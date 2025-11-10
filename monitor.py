@@ -1,191 +1,251 @@
 #!/usr/bin/env python3
-# monitor.py -- Apache log analysis + simple attack detection + Gemini summarization + Fonnte WhatsApp alert
+"""
+monitor.py
+Automated log analysis, attack detection, whatsapp alerting, basic mitigation.
+"""
 
-import os
 import re
+import os
+import sys
 import json
 import time
-import requests
+import subprocess
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
-# optional: from apache_log_parser import make_parser  # if installed
 
-# CONFIG (ubah di Jenkins credentials / env)
-APACHE_ACCESS_LOG = os.environ.get("APACHE_ACCESS_LOG", "/var/log/apache2/access.log")
-APACHE_ERROR_LOG  = os.environ.get("APACHE_ERROR_LOG", "/var/log/apache2/error.log")
-AUTH_LOG = os.environ.get("AUTH_LOG", "/var/log/auth.log")
+# ---------------------------
+# CONFIG (sesuai permintaan: keys ada di sini)
+# ---------------------------
+GEMINI_API_KEY = "AIzaSyCleGyLzyLB4Ni08RiqJo3bq6E789pGWM4"   # <-- API key Gemini (user provided)
+FONNTE_TOKEN = "R3JmjUG5sAmGbSEE7gcG"                      # <-- Fonnte token (user provided)
+FONNTE_DEVICE = "YOUR_DEVICE_NUMBER_OR_ID"                  # <-- ganti dengan nomor device (contoh: "62812xxxx")
+FONNTE_WEBHOOK_URL = "https://api.fonnte.example/send"      # <-- ganti dengan Webhook/endpoint Fonnte yang benar
 
-# External services - ambil dari env vars (set di Jenkins Credentials)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")           # simpan sebagai Secret Text
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-FONNTE_TOKEN = os.environ.get("FONNTE_TOKEN")               # simpan sebagai Secret Text
-FONNTE_ENDPOINT = os.environ.get("FONNTE_ENDPOINT", "https://api.fonnte.com/send")
-ALERT_TARGET_NUMBER = os.environ.get("ALERT_TARGET_NUMBER", "")  # e.g. 62812xxxx (without +)
+# Paths
+APACHE_ACCESS_LOG = "/var/log/apache2/access.log"
+AUTH_LOG = "/var/log/auth.log"
 
-# detection patterns (simple, extendable)
-SQLI_PATTERNS = re.compile(r"\b(union\b|select\b|drop\b|insert\b|update\b|concat\(|information_schema|benchmark\(|sleep\()",
-                          re.IGNORECASE)
-XSS_PATTERNS = re.compile(r"(<script\b|alert\s*\(|onerror=|onload=|javascript:)", re.IGNORECASE)
-SCANNER_UA = re.compile(r"(sqlmap|nikto|masscan|nmap|zgrab|acunetix)", re.IGNORECASE)
-IP_LINE_RE = re.compile(r'^(\S+)')  # simple: first token is remote IP
+# detection thresholds
+BRUTE_FORCE_THRESHOLD = 5         # gagal login 5 kali -> dianggap bruteforce
+BRUTE_FORCE_WINDOW_MIN = 60 * 60  # lihat 1 jam terakhir (deteksi)
+BLOCK_COMMAND = "ufw deny from {ip} to any"  # perintah block (ubah jika mau iptables)
 
-# Read last-N-lines since last run: use state file
-STATE_FILE = "/var/tmp/monitor_state.json"
+# patterns
+SQLI_KEYWORDS = re.compile(r"\b(union|select|insert|update|delete|drop|--|#|;)\b", re.I)
+XSS_KEYWORDS = re.compile(r"(<script|%3Cscript|onerror=|onload=|alert\()", re.I)
+SCANNER_AGENTS = re.compile(r"(sqlmap|nikto|curl|masscan|nmap|acunetix|dirbuster)", re.I)
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        return json.load(open(STATE_FILE))
-    return {"access_pos": 0, "auth_pos":0, "access_mtime":0}
-def save_state(st):
-    json.dump(st, open(STATE_FILE, "w"))
-
-def tail_from(path, start_pos):
-    """Return (lines, end_pos). Uses file offset to resume."""
+# ---------------------------
+# Helpers
+# ---------------------------
+def tail_read(path, num_lines=10000):
+    """Read last num_lines lines from file (efficientish)."""
     if not os.path.exists(path):
-        return [], start_pos
-    with open(path, "rb") as f:
-        f.seek(start_pos)
-        data = f.read().decode(errors="replace")
-        end_pos = f.tell()
-    lines = data.splitlines()
-    return lines, end_pos
+        return []
+    with open(path, "r", errors="ignore") as f:
+        try:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = 1024
+            data = ""
+            while size > 0 and data.count("\n") < num_lines:
+                size -= block
+                if size < 0:
+                    block += size
+                    size = 0
+                    f.seek(0)
+                else:
+                    f.seek(size)
+                data = f.read() + data
+            return data.splitlines()[-num_lines:]
+        except Exception:
+            f.seek(0)
+            return f.read().splitlines()[-num_lines:]
 
-def analyze_access_lines(lines):
-    ip_counter = Counter()
-    url_counter = Counter()
-    status_counter = Counter()
-    ua_counter = Counter()
-    sqli_ips, xss_ips, scanner_ips = set(), set(), set()
 
-    for line in lines:
-        # Simple parsing: assume combined log format
-        parts = line.split()
-        if len(parts) < 9:
+def parse_apache_line(line):
+    # simple combined log format parsing (best-effort)
+    # example: 1.2.3.4 - - [10/Nov/2025:12:34:56 +0000] "GET /index.php?q=1 HTTP/1.1" 200 123 "-" "User-Agent"
+    try:
+        parts = line.split('"')
+        pre = parts[0].strip()
+        req = parts[1]
+        ua = parts[-1].strip()
+        # ip is first token of pre
+        ip = pre.split()[0]
+        status = int(parts[2].strip().split()[0])
+        method, url, proto = req.split()
+        return {"ip": ip, "method": method, "url": url, "status": status, "ua": ua, "raw": line}
+    except Exception:
+        return None
+
+def parse_auth_line(line):
+    return line  # we will regex-match for "Failed password" etc.
+
+# ---------------------------
+# Detection logic
+# ---------------------------
+def analyze_access_log(lines):
+    ips = Counter()
+    urls = Counter()
+    status_codes = Counter()
+    uas = Counter()
+    sqli_hits = []
+    xss_hits = []
+    scanner_hits = []
+
+    for ln in lines:
+        parsed = parse_apache_line(ln)
+        if not parsed:
             continue
-        ip = parts[0]
-        # request is between quotes, naive:
-        mreq = re.search(r'\"(GET|POST|HEAD|PUT|DELETE|OPTIONS) ([^"]+) HTTP/[\d\.]+\"', line)
-        url = mreq.group(2) if mreq else "-"
-        status = parts[-2] if len(parts)>=2 else "-"
-        ua_match = re.search(r'\"[^\"]*\" \"([^\"]+)\"$', line)
-        ua = ua_match.group(1) if ua_match else "-"
+        ip = parsed["ip"]
+        url = parsed["url"]
+        status = parsed["status"]
+        ua = parsed["ua"]
 
-        ip_counter[ip]+=1
-        url_counter[url]+=1
-        status_counter[status]+=1
-        ua_counter[ua]+=1
+        ips[ip] += 1
+        urls[url] += 1
+        status_codes[status] += 1
+        uas[ua] += 1
 
-        if SQLI_PATTERNS.search(line):
-            sqli_ips.add(ip)
-        if XSS_PATTERNS.search(line):
-            xss_ips.add(ip)
-        if SCANNER_UA.search(ua):
-            scanner_ips.add(ip)
+        if SQLI_KEYWORDS.search(url) or SQLI_KEYWORDS.search(ln):
+            sqli_hits.append({"ip": ip, "url": url, "line": ln})
+        if XSS_KEYWORDS.search(url) or XSS_KEYWORDS.search(ln):
+            xss_hits.append({"ip": ip, "url": url, "line": ln})
+        if SCANNER_AGENTS.search(ua):
+            scanner_hits.append({"ip": ip, "ua": ua, "line": ln})
 
     return {
-        "top_ips": ip_counter.most_common(10),
-        "top_urls": url_counter.most_common(10),
-        "status_counts": dict(status_counter),
-        "top_uas": ua_counter.most_common(10),
-        "sqli_ips": list(sqli_ips),
-        "xss_ips": list(xss_ips),
-        "scanner_ips": list(scanner_ips)
+        "top_ips": ips.most_common(10),
+        "top_urls": urls.most_common(10),
+        "status_codes": status_codes.most_common(),
+        "user_agents": uas.most_common(10),
+        "sqli": sqli_hits,
+        "xss": xss_hits,
+        "scanners": scanner_hits
     }
 
-def analyze_auth_lines(lines):
-    # detect failed password attempts and mapping ip -> count
-    failed = Counter()
-    for line in lines:
-        if "Failed password" in line or "invalid user" in line:
-            m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', line)
+def analyze_auth_log(lines, window_sec=BRUTE_FORCE_WINDOW_MIN):
+    # find "Failed password" entries and count per IP within window
+    now = datetime.utcnow()
+    failed = defaultdict(list)
+    for ln in lines:
+        if "Failed password" in ln or "authentication failure" in ln:
+            # try to extract timestamp and ip
+            # auth.log often: "Nov 10 08:12:34 server sshd[1234]: Failed password for invalid user root from 1.2.3.4 port 34567 ssh2"
+            m = re.search(r"from\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", ln)
             if m:
-                failed[m.group(1)] += 1
-    return failed
+                ip = m.group(1)
+                # no exact timestamp parsing (various formats) -> just append
+                failed[ip].append(ln)
+    # evaluate threshold
+    suspects = []
+    for ip, entries in failed.items():
+        if len(entries) >= BRUTE_FORCE_THRESHOLD:
+            suspects.append({"ip": ip, "count": len(entries), "lines": entries[:10]})
+    return {"failed_counts": {ip: len(entries) for ip,entries in failed.items()}, "suspects": suspects}
 
-def send_fonnte_message(target_number, message):
-    if not FONNTE_TOKEN:
-        print("Fonnte token not configured; skipping WhatsApp send.")
-        return False
+# ---------------------------
+# Mitigation
+# ---------------------------
+def block_ip(ip):
+    """Try to block IP using UFW (requires sudo). Return (ok, msg)."""
+    cmd = BLOCK_COMMAND.format(ip=ip)
+    try:
+        subprocess.run(cmd.split(), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return True, f"Blocked {ip} with: {cmd}"
+    except subprocess.CalledProcessError as e:
+        return False, f"Failed to block {ip}: {e.stderr.decode().strip()}"
+
+# ---------------------------
+# Notifier: Fonnte (WhatsApp)
+# ---------------------------
+def send_whatsapp(message, to=FONNTE_DEVICE):
+    """
+    Example: POST JSON to Fonnte webhook. The real API might differ.
+    Replace FONNTE_WEBHOOK_URL, TOKEN, payload format according to Fonnte docs.
+    """
+    import requests
+    headers = {
+        "Authorization": f"Bearer {FONNTE_TOKEN}",
+        "Content-Type": "application/json"
+    }
     payload = {
-        "target": target_number,
+        "to": str(to),
+        "type": "text",
         "message": message
     }
-    headers = {"Authorization": f"Bearer {FONNTE_TOKEN}"}
     try:
-        r = requests.post(FONNTE_ENDPOINT, data=payload, headers=headers, timeout=10)
-        r.raise_for_status()
-        return True
+        resp = requests.post(FONNTE_WEBHOOK_URL, headers=headers, json=payload, timeout=15)
+        return resp.status_code, resp.text
     except Exception as e:
-        print("Fonnte send failed:", e)
-        return False
+        return None, str(e)
 
-def summarize_with_gemini(prompt_text):
-    if not GEMINI_API_KEY:
-        return "Gemini API key not configured."
-    # Simple REST call to Vertex-AI generateContent (example). Adjust based on official SDK
-    url = "https://us-central1-aiplatform.googleapis.com/v1/projects/YOUR_PROJECT/locations/global/models/{}/:predict".format(GEMINI_MODEL)
-    # NOTE: better to use official client libs or adjust endpoint/project. This is a placeholder example.
-    headers = {"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type":"application/json"}
-    body = {
-        "instances": [{"content": prompt_text}]
-    }
-    try:
-        r = requests.post(url, headers=headers, json=body, timeout=15)
-        if r.status_code==200:
-            j = r.json()
-            # best-effort extraction
-            return str(j)[:1500]
-        else:
-            return f"Gemini call failed: {r.status_code} {r.text[:200]}"
-    except Exception as e:
-        return f"Gemini call error: {e}"
+# ---------------------------
+# (Optional) LLM analysis placeholder: Gemini
+# ---------------------------
+def ask_gemini(prompt):
+    """
+    Placeholder usage of Gemini API key. Replace with actual Google Cloud / MakerSuite
+    calls per the up-to-date Gemini API spec.
+    """
+    # Minimal example: we won't call in real if key or endpoint incompatible.
+    return "LLM_ANALYSIS_PLACEHOLDER: " + (prompt[:400] + "...")
 
-def build_admin_message(analysis, auth_failed):
-    now = datetime.utcnow().isoformat()
-    lines = []
-    lines.append(f"Server Log Summary @ {now} (UTC)")
-    lines.append(f"Top IPs: {', '.join([f'{ip}({cnt})' for ip,cnt in analysis['top_ips'][:5]])}")
-    lines.append(f"Top URLs: {', '.join([f'{u}({c})' for u,c in analysis['top_urls'][:5]])}")
-    lines.append(f"Status breakdown: {analysis['status_counts']}")
-    suspicious = []
-    if analysis['sqli_ips']:
-        suspicious.append(f"SQLi IPs: {analysis['sqli_ips'][:5]}")
-    if analysis['xss_ips']:
-        suspicious.append(f"XSS IPs: {analysis['xss_ips'][:5]}")
-    if analysis['scanner_ips']:
-        suspicious.append(f"Scanner UAs detected from {len(analysis['scanner_ips'])} IPs.")
-    if auth_failed:
-        topf = auth_failed.most_common(5)
-        suspicious.append("Failed SSH logins: " + ", ".join([f"{ip}({c})" for ip,c in topf]))
-    lines += suspicious
-    return "\n".join(lines)
+# ---------------------------
+# Main
+# ---------------------------
+def build_report(access_summary, auth_summary):
+    t = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    report = []
+    report.append(f"Monitoring Report - {t}")
+    report.append("Top IPs:")
+    for ip,c in access_summary["top_ips"][:10]:
+        report.append(f" - {ip}: {c} requests")
+    report.append("Top URLs:")
+    for u,c in access_summary["top_urls"][:10]:
+        report.append(f" - {u}: {c}")
+    report.append("Status codes summary:")
+    for sc,c in access_summary["status_codes"][:10]:
+        report.append(f" - {sc}: {c}")
+    report.append("Detected SQLi attempts: " + str(len(access_summary["sqli"])))
+    report.append("Detected XSS attempts: " + str(len(access_summary["xss"])))
+    report.append("Detected scanner UAs: " + str(len(access_summary["scanners"])))
+    report.append("Suspected brute-force (>= {0} fails): {1}".format(BRUTE_FORCE_THRESHOLD, len(auth_summary["suspects"])))
+    return "\n".join(report)
 
 def main():
-    state = load_state()
-    access_lines, access_pos = tail_from(APACHE_ACCESS_LOG, state.get("access_pos",0))
-    auth_lines, auth_pos = tail_from(AUTH_LOG, state.get("auth_pos",0))
+    # read logs
+    access_lines = tail_read(APACHE_ACCESS_LOG, 5000)
+    auth_lines = tail_read(AUTH_LOG, 5000)
 
-    analysis = analyze_access_lines(access_lines)
-    auth_failed = analyze_auth_lines(auth_lines)
+    access_summary = analyze_access_log(access_lines)
+    auth_summary = analyze_auth_log(auth_lines)
 
-    admin_message = build_admin_message(analysis, auth_failed)
-    print(admin_message)
+    report = build_report(access_summary, auth_summary)
+    print(report)
 
-    # Use Gemini to create a smarter summary & recommendations
-    gemini_prompt = "Analyze these findings and give short remediation steps:\n\n" + admin_message
-    gemini_resp = summarize_with_gemini(gemini_prompt)
+    # If suspect brute-force, block and alert
+    alerts = []
+    for s in auth_summary["suspects"]:
+        ip = s["ip"]
+        ok, msg = block_ip(ip)
+        alerts.append({"ip": ip, "blocked": ok, "msg": msg})
 
-    full_alert = admin_message + "\n\nLLM Analysis:\n" + gemini_resp[:1500]
+    # If any sqli/xss/scanner detected, prepare detail
+    if access_summary["sqli"] or access_summary["xss"] or access_summary["scanners"]:
+        alerts.append({"sqli": len(access_summary["sqli"]), "xss": len(access_summary["xss"]), "scanners": len(access_summary["scanners"])})
 
-    # send WhatsApp if suspicious things found
-    suspicious_found = bool(analysis['sqli_ips'] or analysis['xss_ips'] or analysis['scanner_ips'] or sum(auth_failed.values())>0)
-    if suspicious_found and ALERT_TARGET_NUMBER:
-        send_fonnte_message(ALERT_TARGET_NUMBER, full_alert)
+    # Send whatsapp message with summary
+    # cut message length if necessary
+    message = report + "\n\nAlerts:\n" + json.dumps(alerts, indent=2)[:3000]
+    status, resp = send_whatsapp(message)
+    print("WhatsApp send status:", status, resp)
 
-    # Save state
-    state["access_pos"] = access_pos
-    state["auth_pos"] = auth_pos
-    save_state(state)
+    # Optionally ask LLM for smart recommendations
+    llm_prompt = "Analyze this security summary and provide 5 action recommendations:\n\n" + report
+    llm_result = ask_gemini(llm_prompt)
+    print("LLM result (placeholder):", llm_result)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
