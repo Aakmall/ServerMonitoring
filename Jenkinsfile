@@ -10,17 +10,12 @@ pipeline {
     }
 
     environment {
-        // >>> GANTI BAGIAN INI <<<
-        // Nama file Python monitor khusus teman kamu
+        // >>> GANTI BAGIAN INI <<< 
         SCRIPT_FILE = "monitorAkmal.py"
 
-        // Token Fonnte teman kamu
         FONNTE_TOKEN = "R3JmjUG5sAmGbSEE7gcGqy"
-
-        // Nomor WhatsApp target Fonnte (bisa lebih dari 1, pisahkan dengan koma)
         FONNTE_TARGETS = "6281933976553"
 
-        // API Key Gemini milik teman kamu
         GEMINI_API_KEY = "AIzaSyCleGyLzyLB4Ni08RiqJo3bq6E789pGWM4"
         GEMINI_MODEL = "gemini-2.5-flash"
     }
@@ -37,7 +32,7 @@ pipeline {
         stage('Setup Python') {
             steps {
                 sh '''
-                    set -e
+                    set -euo pipefail
                     echo "[SETUP] Membuat virtual environment..."
                     if [ ! -d .venv ]; then
                         python3 -m venv .venv
@@ -57,9 +52,9 @@ pipeline {
 import os, socket, datetime, requests
 HOSTNAME = socket.gethostname()
 ts = datetime.datetime.now().isoformat()
-msg = f"[BotTeman] Jenkins build monitorAkmal.py dimulai di {HOSTNAME} @ {ts}."
+msg = f"[BotTeman] Jenkins build $SCRIPT_FILE dimulai di {HOSTNAME} @ {ts}."
 
-# Cek koneksi Gemini
+# Cek Gemini
 try:
     import google.generativeai as genai
     genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
@@ -92,42 +87,47 @@ PY
         stage('Run Monitor') {
             steps {
                 sh '''
-                    set -e
+                    set -euo pipefail
+
                     LOG_FILE="$(pwd)/monitorAkmal.log"
                     PID_FILE="$(pwd)/monitorAkmal.pid"
                     echo "[RUN] Menjalankan $SCRIPT_FILE..."
 
+                    # Cek script ada
                     if [ ! -f "$SCRIPT_FILE" ]; then
                         echo "[RUN] FAIL: $SCRIPT_FILE tidak ditemukan!"
                         exit 1
                     fi
 
-                    # Hentikan instance lama
+                    # Hentikan instance lama dari PID_FILE
                     if [ -f "$PID_FILE" ]; then
-                        OLD=$(cat "$PID_FILE" || true)
-                        if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
-                            echo "[RUN] Stop monitor lama ($OLD)..."
-                            kill "$OLD" || true
+                        OLD_PID=$(cat "$PID_FILE" || true)
+                        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+                            echo "[RUN] Stop monitor lama (PID=$OLD_PID)..."
+                            kill "$OLD_PID" || true
                             sleep 1
                         fi
                     fi
-
-                    export BUILD_ID=dontKillMe
-                    export JENKINS_NODE_COOKIE=dontKillMe
 
                     # Hentikan proses lama lain
                     pkill -f "$SCRIPT_FILE" 2>/dev/null || true
                     sleep 1
 
-                    echo "[RUN] Python: $(.venv/bin/python -V)"
+                    # Environment agar proses tidak dibunuh Jenkins
+                    export BUILD_ID=dontKillMe
+                    export JENKINS_NODE_COOKIE=dontKillMe
+
+                    # Jalankan Python monitor
+                    echo "[RUN] Python version: $(.venv/bin/python -V)"
                     RUNNER=".venv/bin/python -u \"$SCRIPT_FILE\""
                     nohup setsid bash -c "$RUNNER" > "$LOG_FILE" 2>&1 < /dev/null &
                     echo $! > "$PID_FILE"
-
                     sleep 2
+
+                    # Cek proses berhasil jalan
                     if ps -p $(cat "$PID_FILE") >/dev/null 2>&1; then
                         echo "[RUN] OK: $SCRIPT_FILE berjalan (PID=$(cat "$PID_FILE"))"
-                    else:
+                    else
                         echo "[RUN] FAIL: Gagal menjalankan $SCRIPT_FILE"
                         tail -n 200 "$LOG_FILE" || true
                         exit 1
